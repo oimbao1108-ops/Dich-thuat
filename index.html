@@ -47,6 +47,8 @@
   </select>
   <button id="load" class="primary">Tải model</button>
   <button id="rec" class="primary" disabled>🎤 Ghi</button>
+  <button id="file" disabled>📁 Mở file</button>
+  <input type="file" id="pick" accept="audio/*,video/*" hidden>
   <button id="stop" class="stop" disabled>■ Dừng</button>
   <button id="txt" disabled>.txt</button>
   <button id="srt" disabled>.srt</button>
@@ -89,12 +91,12 @@ onmessage = async e => {
 };`;
 
 // ===== Cau hinh cat cau =====
-const SR = 16000, ENERGY = 0.004, SILENCE = 0.9, MIN_SEG = 1.5, MAX_SEG = 15, PREROLL = 0.5;
+const SR = 16000, ENERGY = 0.0012, SILENCE = 0.9, MIN_SEG = 1.5, MAX_SEG = 15, PREROLL = 0.5;
 
 const $ = id => document.getElementById(id);
 let worker, ready = false, recording = false, segs = [], pending = 0, nextId = 0;
 let ctx, stream, node, source, wake;
-let level = 0, sent = 0, skipped = 0, meter;
+let level = 0, sent = 0, skipped = 0, meter, floor = 0.0005, busy = false;
 let buf = [], bufLen = 0, total = 0, segStart = 0, silence = 0, speech = false;
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
@@ -107,7 +109,7 @@ function fmt(t, ms) {
 }
 function buttons() {
   $("load").disabled = $("model").disabled = ready || !!worker;
-  $("rec").disabled = !ready || recording;
+  $("rec").disabled = $("file").disabled = !ready || recording || busy;
   $("stop").disabled = !recording;
   $("txt").disabled = $("srt").disabled = $("clear").disabled = !segs.length || recording;
 }
@@ -121,7 +123,7 @@ function addRow(s) {
   $("liveVi").textContent = s.vi; $("liveEn").textContent = s.en;
 }
 function recStatus() {
-  const info = ` · mic ${Math.min(100, Math.round(level * 1000))}% · đã gửi ${sent} đoạn, ra chữ ${segs.length}, bỏ qua ${skipped}`;
+  const info = ` · mic ${Math.min(100, Math.round(level * 2000))}% · đã gửi ${sent} đoạn, ra chữ ${segs.length}, bỏ qua ${skipped}`;
   if (recording) status((pending > 2 ? `Đang ghi (xử lý chậm ${pending} đoạn, thử model "Nhanh")` : "Đang ghi…") + info, true);
   else status((pending ? `Đang xử lý nốt ${pending} đoạn…` : "Đã dừng") + info);
 }
@@ -146,11 +148,53 @@ function cut() {
   if (speech && bufLen >= SR * 0.4) {
     const audio = new Float32Array(bufLen); let o = 0;
     for (const b of buf) { audio.set(b, o); o += b.length; }
+    let peak = 0; for (let i = 0; i < audio.length; i++) { const v = Math.abs(audio[i]); if (v > peak) peak = v; }
+    const gain = Math.min(40, 0.9 / (peak || 1));   // tieng nho thi tu khuech dai truoc khi nhan dang
+    if (gain > 1.2) for (let i = 0; i < audio.length; i++) audio[i] *= gain;
     pending++; sent++;
     worker.postMessage({ type: "seg", id: nextId++, start: segStart, end: segStart + bufLen / SR, audio }, [audio.buffer]);
   }
   buf = []; bufLen = 0; speech = false; silence = 0; segStart = total / SR;
 }
+
+function begin() {
+  buf = []; bufLen = 0; speech = false; silence = 0;
+  const t0 = segs.length ? segs[segs.length - 1].end + 1 : 0;   // ghi tiep noi vao ban cu
+  total = t0 * SR; segStart = t0;
+}
+function feed(f) {
+  let sum = 0; for (let i = 0; i < f.length; i++) sum += f[i] * f[i];
+  const rms = Math.sqrt(sum / f.length);
+  total += f.length; buf.push(f); bufLen += f.length;
+  level = Math.max(rms, level * 0.8);
+  const thr = Math.max(ENERGY, floor * 2.5);   // nguong tu dieu chinh theo do on nen
+  if (rms >= thr) { speech = true; silence = 0; } else { silence += f.length / SR; floor = floor * 0.95 + rms * 0.05; }
+  if (!speech) {
+    while (buf.length > 1 && bufLen - buf[0].length >= PREROLL * SR) bufLen -= buf.shift().length;
+    segStart = (total - bufLen) / SR; return;
+  }
+  const dur = bufLen / SR;
+  if ((silence >= SILENCE && dur >= MIN_SEG) || dur >= MAX_SEG) cut();
+}
+
+$("file").onclick = () => $("pick").click();
+$("pick").onchange = async () => {
+  const f = $("pick").files[0]; $("pick").value = "";
+  if (!f) return;
+  busy = true; buttons(); status("Đang đọc file " + f.name + "…");
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext, ac = new AC();
+    const dec = await new Promise(async (ok, err) => ac.decodeAudioData(await f.arrayBuffer(), ok, err));
+    ac.close();
+    const off = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, Math.ceil(dec.duration * SR), SR);
+    const src = off.createBufferSource(); src.buffer = dec; src.connect(off.destination); src.start();
+    const pcm = (await off.startRendering()).getChannelData(0);
+    begin(); floor = 0.0005;
+    for (let i = 0; i < pcm.length; i += 4096) feed(pcm.slice(i, i + 4096));
+    cut();
+  } catch (e) { status("Không đọc được file: " + (e && e.message || e)); busy = false; buttons(); return; }
+  busy = false; recStatus(); buttons();
+};
 
 $("rec").onclick = async () => {
   try {
@@ -161,9 +205,7 @@ $("rec").onclick = async () => {
   const ratio = ctx.sampleRate / SR;   // phong khi Safari khong cho 16 kHz
   source = ctx.createMediaStreamSource(stream);
   node = ctx.createScriptProcessor(4096, 1, 1);
-  buf = []; bufLen = 0; speech = false; silence = 0;
-  const t0 = segs.length ? segs[segs.length - 1].end + 1 : 0;   // ghi tiep noi vao ban cu
-  total = t0 * SR; segStart = t0;
+  begin();
   node.onaudioprocess = e => {
     let f = e.inputBuffer.getChannelData(0);
     if (ratio !== 1) {
@@ -175,17 +217,7 @@ $("rec").onclick = async () => {
       }
       f = r;
     } else f = new Float32Array(f);
-    let sum = 0; for (let i = 0; i < f.length; i++) sum += f[i] * f[i];
-    const rms = Math.sqrt(sum / f.length);
-    total += f.length; buf.push(f); bufLen += f.length;
-    level = Math.max(rms, level * 0.8);
-    if (rms >= ENERGY) { speech = true; silence = 0; } else silence += f.length / SR;
-    if (!speech) {
-      while (buf.length > 1 && bufLen - buf[0].length >= PREROLL * SR) bufLen -= buf.shift().length;
-      segStart = (total - bufLen) / SR; return;
-    }
-    const dur = bufLen / SR;
-    if ((silence >= SILENCE && dur >= MIN_SEG) || dur >= MAX_SEG) cut();
+    feed(f);
   };
   const mute = ctx.createGain(); mute.gain.value = 0;
   source.connect(node); node.connect(mute); mute.connect(ctx.destination);
