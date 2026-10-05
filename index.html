@@ -42,11 +42,13 @@
 <header>
   <h1>Dịch trực tiếp Anh → Việt</h1>
   <select id="model" aria-label="Model nhận dạng">
-    <option value="Xenova/whisper-small.en">Chính xác (small, ~250 MB)</option>
-    <option value="Xenova/whisper-base.en">Nhanh (base, ~80 MB)</option>
+    <option value="Xenova/whisper-base.en">Nhanh (base)</option>
+    <option value="Xenova/whisper-small.en">Chính xác (small)</option>
   </select>
   <button id="load" class="primary">Tải model</button>
   <button id="rec" class="primary" disabled>🎤 Ghi</button>
+  <label><input type="checkbox" id="gpu" checked> GPU</label>
+  <label><input type="checkbox" id="clean"> Lọc ồn</label>
   <button id="file" disabled>📁 Mở file</button>
   <input type="file" id="pick" accept="audio/*,video/*" hidden>
   <button id="stop" class="stop" disabled>■ Dừng</button>
@@ -66,6 +68,8 @@
 const WORKER = `
 import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.0";
 env.allowLocalModels = false;
+const threads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
+env.backends.onnx.wasm.numThreads = threads;
 let asr, mt;
 const prog = p => { if (p.status === "progress") postMessage({ type: "progress", file: p.file, pct: p.progress }); };
 onmessage = async e => {
@@ -73,10 +77,18 @@ onmessage = async e => {
   try {
     if (m.type === "load") {
       postMessage({ type: "info", text: "Đang tải model nhận dạng giọng nói…" });
-      asr = await pipeline("automatic-speech-recognition", m.model, { dtype: "q8", device: "wasm", progress_callback: prog });
+      let mode = "CPU " + threads + " luồng";
+      if (m.gpu && navigator.gpu) {
+        try {
+          asr = await pipeline("automatic-speech-recognition", m.model, { dtype: { encoder_model: "fp32", decoder_model_merged: "q4" }, device: "webgpu", progress_callback: prog });
+          await asr(new Float32Array(16000));   // chay thu 1 giay im lang de chac GPU dung duoc
+          mode = "GPU";
+        } catch (err) { asr = null; postMessage({ type: "info", text: "GPU không dùng được, chuyển sang CPU…" }); }
+      }
+      if (!asr) asr = await pipeline("automatic-speech-recognition", m.model, { dtype: "q8", device: "wasm", progress_callback: prog });
       postMessage({ type: "info", text: "Đang tải model dịch…" });
       mt = await pipeline("translation", "Xenova/opus-mt-en-vi", { dtype: "q8", device: "wasm", progress_callback: prog });
-      postMessage({ type: "ready" });
+      postMessage({ type: "ready", mode });
     } else if (m.type === "seg") {
       const r = await asr(m.audio);
       const en = (r.text || "").trim();
@@ -91,7 +103,7 @@ onmessage = async e => {
 };`;
 
 // ===== Cau hinh cat cau =====
-const SR = 16000, ENERGY = 0.0012, SILENCE = 0.9, MIN_SEG = 1.5, MAX_SEG = 15, PREROLL = 0.5;
+const SR = 16000, ENERGY = 0.0012, SILENCE = 0.5, MIN_SEG = 1.2, MAX_SEG = 7, PREROLL = 0.5;
 
 const $ = id => document.getElementById(id);
 let worker, ready = false, recording = false, segs = [], pending = 0, nextId = 0;
@@ -99,7 +111,11 @@ let ctx, stream, node, source, wake;
 let level = 0, sent = 0, skipped = 0, meter, floor = 0.0005, busy = false;
 let buf = [], bufLen = 0, total = 0, segStart = 0, silence = 0, speech = false;
 
-if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").then(async () => {
+  await navigator.serviceWorker.ready;
+  let once = false; try { once = sessionStorage.getItem("coi"); sessionStorage.setItem("coi", "1"); } catch { once = true; }
+  if (!self.crossOriginIsolated && !once) location.reload();   // tai lai 1 lan de bat che do da luong
+}).catch(() => {});
 
 function status(text, on) { $("stext").textContent = text; $("dot").classList.toggle("on", !!on); }
 function fmt(t, ms) {
@@ -108,7 +124,8 @@ function fmt(t, ms) {
   return ms ? s + "," + String(Math.floor((t % 1) * 1000)).padStart(3, "0") : s;
 }
 function buttons() {
-  $("load").disabled = $("model").disabled = ready || !!worker;
+  $("load").disabled = $("model").disabled = $("gpu").disabled = ready || !!worker;
+  $("clean").disabled = recording;
   $("rec").disabled = $("file").disabled = !ready || recording || busy;
   $("stop").disabled = !recording;
   $("txt").disabled = $("srt").disabled = $("clear").disabled = !segs.length || recording;
@@ -136,21 +153,21 @@ $("load").onclick = () => {
     const m = e.data;
     if (m.type === "info") status(m.text);
     else if (m.type === "progress") $("prog").value = m.pct || 0;
-    else if (m.type === "ready") { ready = true; $("prog").hidden = true; status("Sẵn sàng. Bấm Ghi để bắt đầu."); buttons(); }
+    else if (m.type === "ready") { ready = true; $("prog").hidden = true; status("Sẵn sàng (" + m.mode + "). Bấm Ghi để bắt đầu."); buttons(); }
     else if (m.type === "seg") { pending--; segs.push(m); segs.sort((a, b) => a.start - b.start); addRow(m); recStatus(); buttons(); }
     else if (m.type === "skip") { pending--; skipped++; recStatus(); }
     else if (m.type === "error") { pending = Math.max(0, pending - 1); status("Lỗi: " + m.text); if (!ready) { $("prog").hidden = true; worker.terminate(); worker = null; buttons(); } }
   };
-  worker.postMessage({ type: "load", model: $("model").value });
+  worker.postMessage({ type: "load", model: $("model").value, gpu: $("gpu").checked });
 };
 
 function cut() {
   if (speech && bufLen >= SR * 0.4) {
     const audio = new Float32Array(bufLen); let o = 0;
     for (const b of buf) { audio.set(b, o); o += b.length; }
-    let peak = 0; for (let i = 0; i < audio.length; i++) { const v = Math.abs(audio[i]); if (v > peak) peak = v; }
-    const gain = Math.min(40, 0.9 / (peak || 1));   // tieng nho thi tu khuech dai truoc khi nhan dang
-    if (gain > 1.2) for (let i = 0; i < audio.length; i++) audio[i] *= gain;
+    let sq = 0; for (let i = 0; i < audio.length; i++) sq += audio[i] * audio[i];
+    const gain = Math.min(80, 0.08 / (Math.sqrt(sq / audio.length) || 1));   // dua am luong trung binh ve muc chuan
+    if (gain > 1.2) for (let i = 0; i < audio.length; i++) audio[i] = Math.max(-1, Math.min(1, audio[i] * gain));
     pending++; sent++;
     worker.postMessage({ type: "seg", id: nextId++, start: segStart, end: segStart + bufLen / SR, audio }, [audio.buffer]);
   }
@@ -198,7 +215,7 @@ $("pick").onchange = async () => {
 
 $("rec").onclick = async () => {
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true } });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: $("clean").checked, noiseSuppression: $("clean").checked, autoGainControl: true } });
   } catch (e) { status("Không dùng được micro: " + e.message + " (kiểm tra quyền micro của Safari)"); return; }
   ctx = new (window.AudioContext || window.webkitAudioContext)();   // dung tan so goc cua may: ep 16 kHz lam Safari tren iPad thu ra im lang
   await ctx.resume();
