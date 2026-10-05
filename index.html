@@ -89,11 +89,12 @@ onmessage = async e => {
 };`;
 
 // ===== Cau hinh cat cau =====
-const SR = 16000, ENERGY = 0.006, SILENCE = 0.9, MIN_SEG = 1.5, MAX_SEG = 15, PREROLL = 0.5;
+const SR = 16000, ENERGY = 0.004, SILENCE = 0.9, MIN_SEG = 1.5, MAX_SEG = 15, PREROLL = 0.5;
 
 const $ = id => document.getElementById(id);
 let worker, ready = false, recording = false, segs = [], pending = 0, nextId = 0;
 let ctx, stream, node, source, wake;
+let level = 0, sent = 0, skipped = 0, meter;
 let buf = [], bufLen = 0, total = 0, segStart = 0, silence = 0, speech = false;
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
@@ -120,8 +121,9 @@ function addRow(s) {
   $("liveVi").textContent = s.vi; $("liveEn").textContent = s.en;
 }
 function recStatus() {
-  if (recording) status(pending > 2 ? `Đang ghi (đang xử lý chậm ${pending} đoạn, thử model "Nhanh")` : "Đang ghi…", true);
-  else status(pending ? `Đang xử lý nốt ${pending} đoạn…` : "Đã dừng");
+  const info = ` · mic ${Math.min(100, Math.round(level * 1000))}% · đã gửi ${sent} đoạn, ra chữ ${segs.length}, bỏ qua ${skipped}`;
+  if (recording) status((pending > 2 ? `Đang ghi (xử lý chậm ${pending} đoạn, thử model "Nhanh")` : "Đang ghi…") + info, true);
+  else status((pending ? `Đang xử lý nốt ${pending} đoạn…` : "Đã dừng") + info);
 }
 
 $("load").onclick = () => {
@@ -134,7 +136,7 @@ $("load").onclick = () => {
     else if (m.type === "progress") $("prog").value = m.pct || 0;
     else if (m.type === "ready") { ready = true; $("prog").hidden = true; status("Sẵn sàng. Bấm Ghi để bắt đầu."); buttons(); }
     else if (m.type === "seg") { pending--; segs.push(m); segs.sort((a, b) => a.start - b.start); addRow(m); recStatus(); buttons(); }
-    else if (m.type === "skip") { pending--; recStatus(); }
+    else if (m.type === "skip") { pending--; skipped++; recStatus(); }
     else if (m.type === "error") { pending = Math.max(0, pending - 1); status("Lỗi: " + m.text); if (!ready) { $("prog").hidden = true; worker.terminate(); worker = null; buttons(); } }
   };
   worker.postMessage({ type: "load", model: $("model").value });
@@ -144,7 +146,7 @@ function cut() {
   if (speech && bufLen >= SR * 0.4) {
     const audio = new Float32Array(bufLen); let o = 0;
     for (const b of buf) { audio.set(b, o); o += b.length; }
-    pending++;
+    pending++; sent++;
     worker.postMessage({ type: "seg", id: nextId++, start: segStart, end: segStart + bufLen / SR, audio }, [audio.buffer]);
   }
   buf = []; bufLen = 0; speech = false; silence = 0; segStart = total / SR;
@@ -154,7 +156,7 @@ $("rec").onclick = async () => {
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true } });
   } catch (e) { status("Không dùng được micro: " + e.message + " (kiểm tra quyền micro của Safari)"); return; }
-  ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SR });
+  ctx = new (window.AudioContext || window.webkitAudioContext)();   // dung tan so goc cua may: ep 16 kHz lam Safari tren iPad thu ra im lang
   await ctx.resume();
   const ratio = ctx.sampleRate / SR;   // phong khi Safari khong cho 16 kHz
   source = ctx.createMediaStreamSource(stream);
@@ -166,12 +168,17 @@ $("rec").onclick = async () => {
     let f = e.inputBuffer.getChannelData(0);
     if (ratio !== 1) {
       const n = Math.floor(f.length / ratio), r = new Float32Array(n);
-      for (let i = 0; i < n; i++) r[i] = f[Math.floor(i * ratio)];
+      for (let i = 0; i < n; i++) {   // lay trung binh tung nhom mau de ha xuong 16 kHz
+        const a = Math.floor(i * ratio), b = Math.min(f.length, Math.floor((i + 1) * ratio));
+        let s = 0; for (let j = a; j < b; j++) s += f[j];
+        r[i] = s / Math.max(1, b - a);
+      }
       f = r;
     } else f = new Float32Array(f);
     let sum = 0; for (let i = 0; i < f.length; i++) sum += f[i] * f[i];
     const rms = Math.sqrt(sum / f.length);
     total += f.length; buf.push(f); bufLen += f.length;
+    level = Math.max(rms, level * 0.8);
     if (rms >= ENERGY) { speech = true; silence = 0; } else silence += f.length / SR;
     if (!speech) {
       while (buf.length > 1 && bufLen - buf[0].length >= PREROLL * SR) bufLen -= buf.shift().length;
@@ -184,13 +191,14 @@ $("rec").onclick = async () => {
   source.connect(node); node.connect(mute); mute.connect(ctx.destination);
   try { wake = await navigator.wakeLock?.request("screen"); } catch {}
   recording = true; recStatus(); buttons();
+  meter = setInterval(recStatus, 300);
 };
 
 $("stop").onclick = () => {
   node.onaudioprocess = null; cut();
   node.disconnect(); source.disconnect(); stream.getTracks().forEach(t => t.stop()); ctx.close();
   wake?.release?.(); wake = null;
-  recording = false; recStatus(); buttons();
+  clearInterval(meter); recording = false; recStatus(); buttons();
 };
 
 function save(name, text) {
